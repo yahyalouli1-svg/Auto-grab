@@ -1,0 +1,1346 @@
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+local StealRadius = 60
+local StealDuration = 1.3
+local StealMode = 1
+local STEAL_MODE_CFG = {
+	[1] = { threshold = 0.90, nearDist = 14 },
+	[2] = { threshold = 0.85, nearDist = 12 },
+	[3] = { threshold = 0.80, nearDist = 11 },
+	[4] = { threshold = 0.75, nearDist = 10 },
+}
+local AutoStealEnabled = false
+local isStealing = false
+local stealVisualPct = 0
+local StealData = {}
+local stealConn = nil
+local CONFIG_KEY = "VexAutoSteal_v1.json"
+local _asp = false
+local selectedBG = 1
+local stealBarLocked = false
+
+local StealBarScale = 100
+local StealBarOrientation = "Normal"
+local StealBarColorName = "Pink"
+local NORMAL_BASE_SCALE = 0.8
+
+local BAR_COLORS = {
+	{ name = "Blue",  color = Color3.fromRGB(60, 140, 255) },
+	{ name = "Black", color = Color3.fromRGB(20, 20, 20) },
+	{ name = "Gray",  color = Color3.fromRGB(140, 140, 140) },
+	{ name = "Green", color = Color3.fromRGB(80, 220, 120) },
+	{ name = "Pink",  color = Color3.fromRGB(255, 70, 120) },
+	{ name = "Red",   color = Color3.fromRGB(255, 50, 50) },
+}
+local function getBarColor()
+	for _, c in ipairs(BAR_COLORS) do
+		if c.name == StealBarColorName then return c.color end
+	end
+	return BAR_COLORS[5].color
+end
+
+local BG_IDS = {
+	"rbxassetid://116674700560244",
+	"rbxassetid://109413351901113",
+	"rbxassetid://117749035897416",
+	"rbxassetid://79632942355765",
+}
+
+local stealBarFrameRef = nil
+local mainFrameRef = nil
+
+local function saveConfig()
+	pcall(function()
+		if not writefile then return end
+		local data = {
+			autoSteal = AutoStealEnabled,
+			stealMode = StealMode,
+			stealRadius = StealRadius,
+			selectedBG = selectedBG,
+			stealBarScale = StealBarScale,
+			stealBarOrientation = StealBarOrientation,
+			stealBarColor = StealBarColorName,
+			locked = stealBarLocked,
+		}
+		if stealBarFrameRef then
+			local p = stealBarFrameRef.Position
+			data.barPosXS, data.barPosX, data.barPosYS, data.barPosY = p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset
+		end
+		if mainFrameRef then
+			local p = mainFrameRef.Position
+			data.mainPosXS, data.mainPosX, data.mainPosYS, data.mainPosY = p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset
+		end
+		writefile(CONFIG_KEY, HttpService:JSONEncode(data))
+	end)
+end
+
+local function loadConfig()
+	local ok, raw = pcall(function()
+		if readfile then return readfile(CONFIG_KEY) end
+	end)
+	if ok and raw then
+		local ok2, d = pcall(function() return HttpService:JSONDecode(raw) end)
+		if ok2 and d then return d end
+	end
+	return nil
+end
+
+local function autoSave()
+	if _asp then return end
+	_asp = true
+	task.delay(2, function() _asp = false; saveConfig() end)
+end
+
+local function getGuiParent()
+	if typeof(gethui) == "function" then
+		local ok, r = pcall(gethui); if ok and r then return r end
+	end
+	local ok, cg = pcall(function() return game:GetService("CoreGui") end)
+	if ok and cg then return cg end
+	return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local function new(cls, props, par)
+	local o = Instance.new(cls)
+	for k, v in pairs(props or {}) do o[k] = v end
+	o.Parent = par
+	return o
+end
+
+local function corner(obj, r)
+	return new("UICorner", { CornerRadius = UDim.new(0, r) }, obj)
+end
+
+local function mkStroke(obj, col, th)
+	return new("UIStroke", {
+		Color = col,
+		Thickness = th or 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	}, obj)
+end
+
+local function getHRP()
+	local c = LocalPlayer.Character
+	if c then
+		return c:FindFirstChild("HumanoidRootPart")
+			or c:FindFirstChild("Torso")
+			or c:FindFirstChild("UpperTorso")
+	end
+end
+
+local function isMyPlotByName(plotName)
+	local plots = workspace:FindFirstChild("Plots"); if not plots then return false end
+	local plot = plots:FindFirstChild(plotName); if not plot then return false end
+	local sign = plot:FindFirstChild("PlotSign")
+	if sign then
+		local yb = sign:FindFirstChild("YourBase")
+		if yb and yb:IsA("BillboardGui") then return yb.Enabled == true end
+	end
+	return false
+end
+
+local function getPromptPosition(prompt)
+	local att = prompt:FindFirstChild("Attachment")
+	if att then return att.WorldPosition or att.Position end
+	local p = prompt.Parent
+	while p and p ~= workspace do
+		if p.Name == "Spawn" and p:IsA("BasePart") then return p.Position end
+		p = p.Parent
+	end
+	if prompt.Parent and prompt.Parent:IsA("BasePart") then return prompt.Parent.Position end
+	return nil
+end
+
+local function findNearestPrompt()
+	local hrp = getHRP(); if not hrp then return nil end
+	local plots = workspace:FindFirstChild("Plots"); if not plots then return nil end
+	local nearest, dist = nil, math.huge
+	for _, plot in ipairs(plots:GetChildren()) do
+		if isMyPlotByName(plot.Name) then continue end
+		local pods = plot:FindFirstChild("AnimalPodiums"); if not pods then continue end
+		for _, pod in ipairs(pods:GetChildren()) do
+			local base = pod:FindFirstChild("Base"); if not base then continue end
+			local spawn = base:FindFirstChild("Spawn"); if not spawn then continue end
+			local d = (spawn.Position - hrp.Position).Magnitude
+			if d <= StealRadius and d < dist then
+				local att = spawn:FindFirstChild("PromptAttachment")
+				if att then
+					for _, p in ipairs(att:GetChildren()) do
+						if p:IsA("ProximityPrompt") and p.ActionText and p.ActionText:find("Steal") then
+							nearest, dist = p, d
+						end
+					end
+				end
+			end
+		end
+	end
+	return nearest
+end
+
+local function executeSteal(prompt)
+	if isStealing or not AutoStealEnabled then return end
+	if not StealData[prompt] then
+		StealData[prompt] = { hold = {}, trigger = {}, ready = true }
+		if getconnections then
+			for _, c in ipairs(getconnections(prompt.PromptButtonHoldBegan)) do
+				if c.Function then table.insert(StealData[prompt].hold, c.Function) end
+			end
+			for _, c in ipairs(getconnections(prompt.Triggered)) do
+				if c.Function then table.insert(StealData[prompt].trigger, c.Function) end
+			end
+		end
+	end
+	local data = StealData[prompt]
+	if not data.ready then return end
+	data.ready = false
+	isStealing = true
+	stealVisualPct = 0
+	task.spawn(function()
+		for _, f in ipairs(data.hold) do pcall(f) end
+	end)
+	local cfg = STEAL_MODE_CFG[StealMode] or STEAL_MODE_CFG[1]
+	local threshold = cfg.threshold
+	local nearDist = cfg.nearDist
+	local totalTime = tonumber(StealDuration) or 1.3
+	local timeToThreshold = totalTime * threshold
+	local timeAfterThreshold = totalTime - timeToThreshold
+	local startTime = tick()
+	while tick() - startTime < timeToThreshold do
+		if not AutoStealEnabled then
+			isStealing = false; data.ready = true; stealVisualPct = 0; return
+		end
+		stealVisualPct = math.clamp((tick() - startTime) / totalTime, 0, threshold)
+		task.wait()
+	end
+	stealVisualPct = threshold
+	local hrp = getHRP()
+	local stillNear = false
+	if hrp then
+		local targetPos = getPromptPosition(prompt)
+		if targetPos and (targetPos - hrp.Position).Magnitude <= nearDist then
+			stillNear = true
+		end
+	end
+	if not stillNear then
+		local holdStart = tick()
+		while tick() - holdStart < 4 do
+			if not AutoStealEnabled then
+				isStealing = false; data.ready = true; stealVisualPct = 0; return
+			end
+			stealVisualPct = threshold
+			local hrp2 = getHRP()
+			if hrp2 then
+				local tp = getPromptPosition(prompt)
+				if tp and (tp - hrp2.Position).Magnitude <= nearDist then
+					stillNear = true; break
+				end
+			end
+			task.wait()
+		end
+		if not stillNear then
+			isStealing = false; data.ready = true; stealVisualPct = 0; return
+		end
+	end
+	local resumeTime = tick()
+	while tick() - resumeTime < timeAfterThreshold do
+		if not AutoStealEnabled then
+			isStealing = false; data.ready = true; stealVisualPct = 0; return
+		end
+		local fin = (tick() - resumeTime) / math.max(timeAfterThreshold, 0.01)
+		stealVisualPct = threshold + fin * (1 - threshold)
+		task.wait()
+	end
+	stealVisualPct = 1
+	for _, f in ipairs(data.trigger) do pcall(f) end
+	task.wait(0.05)
+	data.ready = true
+	isStealing = false
+	stealVisualPct = 0
+end
+
+local function startAutoSteal()
+	if stealConn then return end
+	stealConn = RunService.Heartbeat:Connect(function()
+		if isStealing or not AutoStealEnabled then return end
+		local ok, prompt = pcall(findNearestPrompt)
+		if ok and prompt then pcall(executeSteal, prompt) end
+	end)
+end
+
+local function stopAutoSteal()
+	if stealConn then stealConn:Disconnect(); stealConn = nil end
+	isStealing = false
+	stealVisualPct = 0
+end
+
+local parent = getGuiParent()
+local oldGui = parent:FindFirstChild("VexAutoStealGui")
+if oldGui then oldGui:Destroy() end
+
+local gui = new("ScreenGui", {
+	Name = "VexAutoStealGui",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, nil)
+
+if type(syn) == "table" and type(syn.protect_gui) == "function" then
+	pcall(syn.protect_gui, gui)
+elseif typeof(protectgui) == "function" then
+	pcall(protectgui, gui)
+end
+pcall(function() gui.Parent = parent end)
+if not gui.Parent then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+local GUI_W = 230
+local GUI_H_EXPANDED  = 377
+local GUI_H_COLLAPSED = 58
+
+local main = new("Frame", {
+	Name = "MainFrame",
+	Size = UDim2.fromOffset(GUI_W, GUI_H_EXPANDED),
+	Position = UDim2.new(0.5, -GUI_W / 2, 0.5, -GUI_H_EXPANDED / 2),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ClipsDescendants = true,
+	Active = true,
+	ZIndex = 1,
+}, gui)
+mainFrameRef = main
+corner(main, 14)
+
+local bgBase = new("Frame", {
+	Size = UDim2.new(1, 0, 1, 0),
+	BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+	BackgroundTransparency = 0,
+	BorderSizePixel = 0,
+	ZIndex = 2,
+}, main)
+corner(bgBase, 14)
+
+local bgImage = new("ImageLabel", {
+	Size = UDim2.new(1, 0, 1, 0),
+	BackgroundTransparency = 1,
+	Image = BG_IDS[1],
+	ImageTransparency = 0,
+	ScaleType = Enum.ScaleType.Stretch,
+	ZIndex = 3,
+}, bgBase)
+corner(bgImage, 14)
+
+local overlay = new("Frame", {
+	Size = UDim2.new(1, 0, 1, 0),
+	BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+	BackgroundTransparency = 0.50,
+	BorderSizePixel = 0,
+	ZIndex = 4,
+}, main)
+corner(overlay, 14)
+
+mkStroke(main, Color3.fromRGB(60, 60, 60), 1.5)
+
+local header = new("Frame", {
+	Size = UDim2.new(1, -6, 0, 44),
+	Position = UDim2.fromOffset(3, 3),
+	BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+	BackgroundTransparency = 0.38,
+	BorderSizePixel = 0,
+	ZIndex = 6,
+}, main)
+corner(header, 10)
+mkStroke(header, Color3.fromRGB(45, 45, 45), 1)
+
+local titleDot = new("Frame", {
+	Size = UDim2.fromOffset(8, 8),
+	Position = UDim2.fromOffset(12, 18),
+	BackgroundColor3 = Color3.fromRGB(255, 80, 100),
+	BorderSizePixel = 0,
+	ZIndex = 8,
+}, header)
+corner(titleDot, 4)
+
+new("TextLabel", {
+	Size = UDim2.new(0, 160, 0, 14),
+	Position = UDim2.fromOffset(26, 7),
+	BackgroundTransparency = 1,
+	Text = "VEX AUTO STEAL 🍀",
+	TextColor3 = Color3.fromRGB(255, 255, 255),
+	Font = Enum.Font.GothamBlack,
+	TextSize = 11,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 8,
+}, header)
+
+new("TextLabel", {
+	Size = UDim2.new(0, 130, 0, 11),
+	Position = UDim2.fromOffset(26, 23),
+	BackgroundTransparency = 1,
+	Text = ".gg/8tVEJgUVPR",
+	TextColor3 = Color3.fromRGB(110, 110, 110),
+	Font = Enum.Font.Gotham,
+	TextSize = 9,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 8,
+}, header)
+
+local isCollapsed = false
+
+local collapseBtn = new("TextButton", {
+	Size = UDim2.fromOffset(24, 24),
+	Position = UDim2.new(1, -28, 0.5, -12),
+	BackgroundColor3 = Color3.fromRGB(20, 20, 20),
+	AutoButtonColor = false,
+	BorderSizePixel = 0,
+	Text = "–",
+	TextColor3 = Color3.fromRGB(200, 200, 200),
+	Font = Enum.Font.GothamBlack,
+	TextSize = 14,
+	ZIndex = 9,
+}, header)
+corner(collapseBtn, 7)
+mkStroke(collapseBtn, Color3.fromRGB(55, 55, 55), 1)
+
+local lockBtn = new("TextButton", {
+	Size = UDim2.fromOffset(24, 24),
+	Position = UDim2.new(1, -84, 0.5, -12),
+	BackgroundColor3 = Color3.fromRGB(20, 20, 20),
+	AutoButtonColor = false,
+	BorderSizePixel = 0,
+	Text = "🔓",
+	TextColor3 = Color3.fromRGB(200, 200, 200),
+	Font = Enum.Font.GothamBlack,
+	TextSize = 11,
+	ZIndex = 9,
+}, header)
+corner(lockBtn, 7)
+mkStroke(lockBtn, Color3.fromRGB(55, 55, 55), 1)
+
+local function applyLockVisual()
+	lockBtn.Text = stealBarLocked and "🔒" or "🔓"
+	TweenService:Create(lockBtn, TweenInfo.new(0.15), {
+		BackgroundColor3 = stealBarLocked and Color3.fromRGB(35, 20, 5) or Color3.fromRGB(20, 20, 20),
+	}):Play()
+end
+
+lockBtn.Activated:Connect(function()
+	stealBarLocked = not stealBarLocked
+	applyLockVisual()
+	saveConfig()
+end)
+
+local bgPanel = new("Frame", {
+	Size = UDim2.fromOffset(GUI_W - 6, 54),
+	Position = UDim2.fromOffset(3, 50),
+	BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+	BackgroundTransparency = 0.30,
+	BorderSizePixel = 0,
+	Visible = false,
+	ZIndex = 20,
+}, main)
+corner(bgPanel, 10)
+mkStroke(bgPanel, Color3.fromRGB(60, 60, 60), 1.2)
+
+new("TextLabel", {
+	Size = UDim2.new(1, -10, 0, 16),
+	Position = UDim2.fromOffset(8, 4),
+	BackgroundTransparency = 1,
+	Text = "BACKGROUND",
+	TextColor3 = Color3.fromRGB(130, 130, 130),
+	Font = Enum.Font.GothamBold,
+	TextSize = 8,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 21,
+}, bgPanel)
+
+local bgThumbs = {}
+local bgThumbSize = 32
+local bgThumbPad = 8
+
+for i, id in ipairs(BG_IDS) do
+	local shell = new("Frame", {
+		Size = UDim2.fromOffset(bgThumbSize + 4, bgThumbSize + 4),
+		Position = UDim2.fromOffset(bgThumbPad + (i - 1) * (bgThumbSize + 4 + 6), 18),
+		BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+		BorderSizePixel = 0,
+		ZIndex = 21,
+	}, bgPanel)
+	corner(shell, 7)
+	local shellStroke = mkStroke(shell, i == selectedBG and Color3.fromRGB(180, 255, 180) or Color3.fromRGB(55, 55, 55), 1.5)
+
+	local thumb = new("ImageLabel", {
+		Size = UDim2.new(1, -4, 1, -4),
+		Position = UDim2.fromOffset(2, 2),
+		BackgroundTransparency = 1,
+		Image = id,
+		ScaleType = Enum.ScaleType.Stretch,
+		ZIndex = 22,
+	}, shell)
+	corner(thumb, 5)
+
+	local btn = new("TextButton", {
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Text = "",
+		ZIndex = 23,
+	}, shell)
+
+	bgThumbs[i] = shellStroke
+
+	btn.Activated:Connect(function()
+		selectedBG = i
+		bgImage.Image = BG_IDS[i]
+		for j, stroke in ipairs(bgThumbs) do
+			TweenService:Create(stroke, TweenInfo.new(0.15), {
+				Color = j == i and Color3.fromRGB(180, 255, 180) or Color3.fromRGB(55, 55, 55),
+			}):Play()
+		end
+		saveConfig()
+	end)
+end
+
+local bgPanelOpen = false
+
+local bgBtn = new("TextButton", {
+	Size = UDim2.fromOffset(24, 24),
+	Position = UDim2.new(1, -56, 0.5, -12),
+	BackgroundColor3 = Color3.fromRGB(20, 20, 20),
+	AutoButtonColor = false,
+	BorderSizePixel = 0,
+	Text = "BG",
+	TextColor3 = Color3.fromRGB(200, 200, 200),
+	Font = Enum.Font.GothamBlack,
+	TextSize = 9,
+	ZIndex = 9,
+}, header)
+corner(bgBtn, 7)
+mkStroke(bgBtn, Color3.fromRGB(55, 55, 55), 1)
+
+bgBtn.Activated:Connect(function()
+	bgPanelOpen = not bgPanelOpen
+	bgPanel.Visible = bgPanelOpen
+end)
+
+local statusPanel = new("Frame", {
+	Size = UDim2.new(1, -18, 0, 30),
+	Position = UDim2.fromOffset(9, 53),
+	BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+	BackgroundTransparency = 0.40,
+	BorderSizePixel = 0,
+	ZIndex = 6,
+}, main)
+corner(statusPanel, 8)
+mkStroke(statusPanel, Color3.fromRGB(40, 40, 40), 1)
+
+local statusDot = new("Frame", {
+	Size = UDim2.fromOffset(7, 7),
+	Position = UDim2.fromOffset(12, 11),
+	BackgroundColor3 = Color3.fromRGB(255, 80, 100),
+	BorderSizePixel = 0,
+	ZIndex = 8,
+}, statusPanel)
+corner(statusDot, 4)
+
+new("TextLabel", {
+	Size = UDim2.new(0, 80, 1, 0),
+	Position = UDim2.fromOffset(26, 0),
+	BackgroundTransparency = 1,
+	Text = "AUTO STEAL",
+	TextColor3 = Color3.fromRGB(130, 130, 130),
+	Font = Enum.Font.GothamBold,
+	TextSize = 8,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 7,
+}, statusPanel)
+
+local radiusPanel = new("Frame", {
+	Size = UDim2.new(1, -18, 0, 30),
+	Position = UDim2.fromOffset(9, 88),
+	BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+	BackgroundTransparency = 0.40,
+	BorderSizePixel = 0,
+	ZIndex = 6,
+}, main)
+corner(radiusPanel, 8)
+mkStroke(radiusPanel, Color3.fromRGB(40, 40, 40), 1)
+
+new("TextLabel", {
+	Size = UDim2.new(0, 60, 1, 0),
+	Position = UDim2.fromOffset(12, 0),
+	BackgroundTransparency = 1,
+	Text = "RADIUS",
+	TextColor3 = Color3.fromRGB(130, 130, 130),
+	Font = Enum.Font.GothamBold,
+	TextSize = 8,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 7,
+}, radiusPanel)
+
+local radiusMinusBtn = new("TextButton", {
+	Size = UDim2.fromOffset(24, 22),
+	Position = UDim2.new(1, -130, 0.5, -11),
+	BackgroundColor3 = Color3.fromRGB(18, 18, 22),
+	BorderSizePixel = 0,
+	Text = "-",
+	TextColor3 = Color3.fromRGB(255, 255, 255),
+	Font = Enum.Font.GothamBlack,
+	TextSize = 14,
+	AutoButtonColor = false,
+	ZIndex = 8,
+}, radiusPanel)
+corner(radiusMinusBtn, 6)
+mkStroke(radiusMinusBtn, Color3.fromRGB(55, 55, 60), 1)
+
+local radiusValBox = new("TextBox", {
+	Size = UDim2.fromOffset(56, 22),
+	Position = UDim2.new(1, -104, 0.5, -11),
+	BackgroundColor3 = Color3.fromRGB(8, 8, 8),
+	BorderSizePixel = 0,
+	Text = tostring(StealRadius),
+	TextColor3 = Color3.fromRGB(220, 220, 220),
+	Font = Enum.Font.GothamBold,
+	TextSize = 10,
+	ClearTextOnFocus = false,
+	ZIndex = 8,
+}, radiusPanel)
+corner(radiusValBox, 6)
+mkStroke(radiusValBox, Color3.fromRGB(180, 180, 180), 1.2)
+
+local radiusPlusBtn = new("TextButton", {
+	Size = UDim2.fromOffset(24, 22),
+	Position = UDim2.new(1, -46, 0.5, -11),
+	BackgroundColor3 = Color3.fromRGB(18, 18, 22),
+	BorderSizePixel = 0,
+	Text = "+",
+	TextColor3 = Color3.fromRGB(255, 255, 255),
+	Font = Enum.Font.GothamBlack,
+	TextSize = 14,
+	AutoButtonColor = false,
+	ZIndex = 8,
+}, radiusPanel)
+corner(radiusPlusBtn, 6)
+mkStroke(radiusPlusBtn, Color3.fromRGB(55, 55, 60), 1)
+
+radiusMinusBtn.Activated:Connect(function()
+	StealRadius = math.max(1, StealRadius - 5)
+	radiusValBox.Text = tostring(StealRadius)
+	autoSave()
+end)
+radiusPlusBtn.Activated:Connect(function()
+	StealRadius = math.min(500, StealRadius + 5)
+	radiusValBox.Text = tostring(StealRadius)
+	autoSave()
+end)
+radiusValBox.FocusLost:Connect(function()
+	local num = tonumber((radiusValBox.Text:gsub("%s+", "")))
+	if num then StealRadius = math.clamp(math.floor(num), 1, 500) end
+	radiusValBox.Text = tostring(StealRadius)
+	autoSave()
+end)
+
+local pctPanel = new("Frame", {
+	Size = UDim2.new(1, -18, 0, 40),
+	Position = UDim2.fromOffset(9, 123),
+	BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+	BackgroundTransparency = 0.40,
+	BorderSizePixel = 0,
+	ZIndex = 6,
+}, main)
+corner(pctPanel, 8)
+mkStroke(pctPanel, Color3.fromRGB(40, 40, 40), 1)
+
+new("TextLabel", {
+	Size = UDim2.new(1, -10, 0, 14),
+	Position = UDim2.fromOffset(12, 3),
+	BackgroundTransparency = 1,
+	Text = "HOLD AT %",
+	TextColor3 = Color3.fromRGB(130, 130, 130),
+	Font = Enum.Font.GothamBold,
+	TextSize = 8,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 7,
+}, pctPanel)
+
+local PCT_OPTIONS = {
+	{ mode = 1, label = "90%" },
+	{ mode = 2, label = "85%" },
+	{ mode = 3, label = "80%" },
+	{ mode = 4, label = "75%" },
+}
+local pctBtns = {}
+
+local function refreshPctButtons()
+	for _, info in ipairs(PCT_OPTIONS) do
+		local b = pctBtns[info.mode]
+		if b then
+			local on = (StealMode == info.mode)
+			TweenService:Create(b, TweenInfo.new(0.15), {
+				BackgroundColor3 = on and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(18, 18, 22),
+			}):Play()
+			b.TextColor3 = on and Color3.fromRGB(0, 0, 0) or Color3.fromRGB(230, 230, 235)
+		end
+	end
+end
+
+for i, info in ipairs(PCT_OPTIONS) do
+	local b = new("TextButton", {
+		Size = UDim2.fromOffset(46, 20),
+		Position = UDim2.fromOffset(8 + (i - 1) * 52, 18),
+		BackgroundColor3 = Color3.fromRGB(18, 18, 22),
+		BorderSizePixel = 0,
+		Text = info.label,
+		TextColor3 = Color3.fromRGB(230, 230, 235),
+		Font = Enum.Font.GothamBold,
+		TextSize = 11,
+		AutoButtonColor = false,
+		ZIndex = 8,
+	}, pctPanel)
+	corner(b, 7)
+	mkStroke(b, Color3.fromRGB(50, 50, 55), 1)
+	pctBtns[info.mode] = b
+	b.Activated:Connect(function()
+		StealMode = info.mode
+		refreshPctButtons()
+		autoSave()
+	end)
+end
+refreshPctButtons()
+
+local autoPanel = new("Frame", {
+	Size = UDim2.new(1, -18, 0, 30),
+	Position = UDim2.fromOffset(9, 168),
+	BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+	BackgroundTransparency = 0.40,
+	BorderSizePixel = 0,
+	ZIndex = 6,
+}, main)
+corner(autoPanel, 8)
+mkStroke(autoPanel, Color3.fromRGB(40, 40, 40), 1)
+
+new("TextLabel", {
+	Size = UDim2.new(0, 110, 1, 0),
+	Position = UDim2.fromOffset(12, 0),
+	BackgroundTransparency = 1,
+	Text = "AUTO STEAL",
+	TextColor3 = Color3.fromRGB(130, 130, 130),
+	Font = Enum.Font.GothamBold,
+	TextSize = 8,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 7,
+}, autoPanel)
+
+local autoTrack = new("Frame", {
+	Size = UDim2.fromOffset(38, 18),
+	Position = UDim2.new(1, -50, 0.5, -9),
+	BackgroundColor3 = Color3.fromRGB(18, 18, 18),
+	BorderSizePixel = 0,
+	ZIndex = 8,
+}, autoPanel)
+corner(autoTrack, 9)
+local autoTrackStroke = mkStroke(autoTrack, Color3.fromRGB(70, 70, 70), 1)
+
+local autoKnob = new("Frame", {
+	Size = UDim2.fromOffset(14, 14),
+	Position = UDim2.fromOffset(2, 2),
+	BackgroundColor3 = Color3.fromRGB(120, 120, 120),
+	BorderSizePixel = 0,
+	ZIndex = 9,
+}, autoTrack)
+corner(autoKnob, 7)
+
+local autoBtn = new("TextButton", {
+	Size = UDim2.new(1, 0, 1, 0),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	Text = "",
+	ZIndex = 10,
+}, autoPanel)
+
+local sizePanel = new("Frame", {
+	Size = UDim2.new(1, -18, 0, 30),
+	Position = UDim2.fromOffset(9, 203),
+	BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+	BackgroundTransparency = 0.40,
+	BorderSizePixel = 0,
+	ZIndex = 6,
+}, main)
+corner(sizePanel, 8)
+mkStroke(sizePanel, Color3.fromRGB(40, 40, 40), 1)
+
+new("TextLabel", {
+	Size = UDim2.new(0, 70, 1, 0),
+	Position = UDim2.fromOffset(12, 0),
+	BackgroundTransparency = 1,
+	Text = "BAR SIZE",
+	TextColor3 = Color3.fromRGB(130, 130, 130),
+	Font = Enum.Font.GothamBold,
+	TextSize = 8,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 7,
+}, sizePanel)
+
+local sizeMinusBtn = new("TextButton", {
+	Size = UDim2.fromOffset(24, 22),
+	Position = UDim2.new(1, -130, 0.5, -11),
+	BackgroundColor3 = Color3.fromRGB(18, 18, 22),
+	BorderSizePixel = 0,
+	Text = "-",
+	TextColor3 = Color3.fromRGB(255, 255, 255),
+	Font = Enum.Font.GothamBlack,
+	TextSize = 14,
+	AutoButtonColor = false,
+	ZIndex = 8,
+}, sizePanel)
+corner(sizeMinusBtn, 6)
+mkStroke(sizeMinusBtn, Color3.fromRGB(55, 55, 60), 1)
+
+local sizeValBox = new("TextBox", {
+	Size = UDim2.fromOffset(56, 22),
+	Position = UDim2.new(1, -104, 0.5, -11),
+	BackgroundColor3 = Color3.fromRGB(8, 8, 8),
+	BorderSizePixel = 0,
+	Text = StealBarScale .. "%",
+	TextColor3 = Color3.fromRGB(220, 220, 220),
+	Font = Enum.Font.GothamBold,
+	TextSize = 10,
+	ClearTextOnFocus = false,
+	ZIndex = 8,
+}, sizePanel)
+corner(sizeValBox, 6)
+mkStroke(sizeValBox, Color3.fromRGB(180, 180, 180), 1.2)
+
+local sizePlusBtn = new("TextButton", {
+	Size = UDim2.fromOffset(24, 22),
+	Position = UDim2.new(1, -46, 0.5, -11),
+	BackgroundColor3 = Color3.fromRGB(18, 18, 22),
+	BorderSizePixel = 0,
+	Text = "+",
+	TextColor3 = Color3.fromRGB(255, 255, 255),
+	Font = Enum.Font.GothamBlack,
+	TextSize = 14,
+	AutoButtonColor = false,
+	ZIndex = 8,
+}, sizePanel)
+corner(sizePlusBtn, 6)
+mkStroke(sizePlusBtn, Color3.fromRGB(55, 55, 60), 1)
+
+local stylePanel = new("Frame", {
+	Size = UDim2.new(1, -18, 0, 30),
+	Position = UDim2.fromOffset(9, 238),
+	BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+	BackgroundTransparency = 0.40,
+	BorderSizePixel = 0,
+	ZIndex = 6,
+}, main)
+corner(stylePanel, 8)
+mkStroke(stylePanel, Color3.fromRGB(40, 40, 40), 1)
+
+new("TextLabel", {
+	Size = UDim2.new(0, 70, 1, 0),
+	Position = UDim2.fromOffset(12, 0),
+	BackgroundTransparency = 1,
+	Text = "BAR STYLE",
+	TextColor3 = Color3.fromRGB(130, 130, 130),
+	Font = Enum.Font.GothamBold,
+	TextSize = 8,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 7,
+}, stylePanel)
+
+local styleBtns = {}
+local STYLE_OPTIONS = { "Normal", "Vertical" }
+
+local updateStealBarLayout
+local applyBarColor
+
+sizeMinusBtn.Activated:Connect(function()
+	StealBarScale = math.max(50, StealBarScale - 5)
+	sizeValBox.Text = StealBarScale .. "%"
+	if updateStealBarLayout then updateStealBarLayout() end
+	autoSave()
+end)
+
+sizePlusBtn.Activated:Connect(function()
+	StealBarScale = math.min(250, StealBarScale + 5)
+	sizeValBox.Text = StealBarScale .. "%"
+	if updateStealBarLayout then updateStealBarLayout() end
+	autoSave()
+end)
+
+sizeValBox.FocusLost:Connect(function()
+	local clean = sizeValBox.Text:gsub("%%", ""):gsub("%s+", "")
+	local num = tonumber(clean)
+	if num then StealBarScale = math.clamp(math.floor(num), 50, 250) end
+	sizeValBox.Text = StealBarScale .. "%"
+	if updateStealBarLayout then updateStealBarLayout() end
+	autoSave()
+end)
+
+local function refreshStyleButtons()
+	for _, opt in ipairs(STYLE_OPTIONS) do
+		local b = styleBtns[opt]
+		if b then
+			local on = (StealBarOrientation == opt)
+			TweenService:Create(b, TweenInfo.new(0.15), {
+				BackgroundColor3 = on and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(18, 18, 22),
+			}):Play()
+			b.TextColor3 = on and Color3.fromRGB(0, 0, 0) or Color3.fromRGB(230, 230, 235)
+		end
+	end
+end
+
+for i, opt in ipairs(STYLE_OPTIONS) do
+	local b = new("TextButton", {
+		Size = UDim2.fromOffset(56, 20),
+		Position = UDim2.fromOffset(80 + (i - 1) * 60, 5),
+		BackgroundColor3 = Color3.fromRGB(18, 18, 22),
+		BorderSizePixel = 0,
+		Text = opt:upper(),
+		TextColor3 = Color3.fromRGB(230, 230, 235),
+		Font = Enum.Font.GothamBold,
+		TextSize = 9,
+		AutoButtonColor = false,
+		ZIndex = 8,
+	}, stylePanel)
+	corner(b, 6)
+	mkStroke(b, Color3.fromRGB(50, 50, 55), 1)
+	styleBtns[opt] = b
+	b.Activated:Connect(function()
+		StealBarOrientation = opt
+		refreshStyleButtons()
+		if updateStealBarLayout then updateStealBarLayout() end
+		autoSave()
+	end)
+end
+refreshStyleButtons()
+
+local colorPanel = new("Frame", {
+	Size = UDim2.new(1, -18, 0, 30),
+	Position = UDim2.fromOffset(9, 273),
+	BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+	BackgroundTransparency = 0.40,
+	BorderSizePixel = 0,
+	ZIndex = 6,
+}, main)
+corner(colorPanel, 8)
+mkStroke(colorPanel, Color3.fromRGB(40, 40, 40), 1)
+
+new("TextLabel", {
+	Size = UDim2.new(0, 70, 1, 0),
+	Position = UDim2.fromOffset(12, 0),
+	BackgroundTransparency = 1,
+	Text = "BAR COLOR",
+	TextColor3 = Color3.fromRGB(130, 130, 130),
+	Font = Enum.Font.GothamBold,
+	TextSize = 8,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 7,
+}, colorPanel)
+
+local colorSwatchStrokes = {}
+local SWATCH = 18
+local SWATCH_GAP = 4
+local swatchStartX = (GUI_W - 18) - 10 - (#BAR_COLORS * SWATCH + (#BAR_COLORS - 1) * SWATCH_GAP)
+
+local function refreshColorSwatches()
+	for _, c in ipairs(BAR_COLORS) do
+		local s = colorSwatchStrokes[c.name]
+		if s then
+			local on = (c.name == StealBarColorName)
+			TweenService:Create(s, TweenInfo.new(0.15), {
+				Color = on and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(60, 60, 65),
+				Thickness = on and 2 or 1,
+			}):Play()
+		end
+	end
+end
+
+for i, c in ipairs(BAR_COLORS) do
+	local sw = new("TextButton", {
+		Size = UDim2.fromOffset(SWATCH, SWATCH),
+		Position = UDim2.new(0, swatchStartX + (i - 1) * (SWATCH + SWATCH_GAP), 0.5, -SWATCH / 2),
+		BackgroundColor3 = c.color,
+		BorderSizePixel = 0,
+		Text = "",
+		AutoButtonColor = false,
+		ZIndex = 8,
+	}, colorPanel)
+	corner(sw, 5)
+	colorSwatchStrokes[c.name] = mkStroke(sw, Color3.fromRGB(60, 60, 65), 1)
+	sw.Activated:Connect(function()
+		StealBarColorName = c.name
+		refreshColorSwatches()
+		if applyBarColor then applyBarColor() end
+		autoSave()
+	end)
+end
+refreshColorSwatches()
+
+local oldBar = parent:FindFirstChild("VexStealBarGui")
+if oldBar then oldBar:Destroy() end
+
+local barGui = new("ScreenGui", {
+	Name = "VexStealBarGui",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	DisplayOrder = 8,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, nil)
+pcall(function() barGui.Parent = parent end)
+if not barGui.Parent then barGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+local SB_NORMAL_W, SB_NORMAL_H = 320, 60
+local SB_VERT_W,   SB_VERT_H   = 36, 160
+
+local stealBarFrame = new("Frame", {
+	Name = "StealBar",
+	Size = UDim2.fromOffset(SB_NORMAL_W, SB_NORMAL_H),
+	Position = UDim2.new(0.5, -SB_NORMAL_W / 2, 0.86, 0),
+	BackgroundColor3 = Color3.fromRGB(8, 8, 10),
+	BorderSizePixel = 0,
+	ZIndex = 20,
+	ClipsDescendants = true,
+	Active = true,
+	Visible = false,
+}, barGui)
+stealBarFrameRef = stealBarFrame
+local barCorner = corner(stealBarFrame, 16)
+local barStroke = mkStroke(stealBarFrame, getBarColor(), 2)
+local barScale = new("UIScale", { Scale = 1 }, stealBarFrame)
+
+applyBarColor = function()
+	TweenService:Create(barStroke, TweenInfo.new(0.15), { Color = getBarColor() }):Play()
+end
+
+local avatarImg = new("ImageLabel", {
+	Size = UDim2.fromOffset(36, 36),
+	Position = UDim2.fromOffset(12, 12),
+	BackgroundColor3 = Color3.fromRGB(30, 30, 34),
+	BorderSizePixel = 0,
+	Image = "",
+	ZIndex = 26,
+}, stealBarFrame)
+corner(avatarImg, 18)
+mkStroke(avatarImg, Color3.fromRGB(80, 80, 85), 1)
+
+task.spawn(function()
+	local ok, url = pcall(function()
+		return Players:GetUserThumbnailAsync(LocalPlayer.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48)
+	end)
+	if ok and url then avatarImg.Image = url end
+end)
+
+local pctLbl = new("TextLabel", {
+	Size = UDim2.fromOffset(80, 30),
+	Position = UDim2.fromOffset(56, 8),
+	BackgroundTransparency = 1,
+	Text = "0%",
+	TextColor3 = Color3.fromRGB(255, 255, 255),
+	Font = Enum.Font.GothamBlack,
+	TextSize = 24,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Center,
+	ZIndex = 26,
+}, stealBarFrame)
+
+local pingLbl = new("TextLabel", {
+	AnchorPoint = Vector2.new(1, 0),
+	Size = UDim2.fromOffset(84, 18),
+	Position = UDim2.new(1, -14, 0, 10),
+	BackgroundTransparency = 1,
+	Text = "PING --",
+	TextColor3 = Color3.fromRGB(255, 255, 255),
+	Font = Enum.Font.GothamBold,
+	TextSize = 11,
+	TextXAlignment = Enum.TextXAlignment.Right,
+	ZIndex = 26,
+}, stealBarFrame)
+
+local fpsLbl = new("TextLabel", {
+	AnchorPoint = Vector2.new(1, 0),
+	Size = UDim2.fromOffset(54, 18),
+	Position = UDim2.new(1, -106, 0, 10),
+	BackgroundTransparency = 1,
+	Text = "FPS --",
+	TextColor3 = Color3.fromRGB(255, 255, 255),
+	Font = Enum.Font.GothamBold,
+	TextSize = 11,
+	TextXAlignment = Enum.TextXAlignment.Right,
+	ZIndex = 26,
+}, stealBarFrame)
+
+local trackFrame = new("Frame", {
+	Size = UDim2.new(1, -70, 0, 7),
+	Position = UDim2.fromOffset(56, 43),
+	BackgroundColor3 = Color3.fromRGB(45, 45, 50),
+	BackgroundTransparency = 0.15,
+	BorderSizePixel = 0,
+	ZIndex = 25,
+}, stealBarFrame)
+corner(trackFrame, 4)
+
+local trackFill = new("Frame", {
+	Size = UDim2.new(0, 0, 1, 0),
+	BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+	BorderSizePixel = 0,
+	ZIndex = 26,
+}, trackFrame)
+corner(trackFill, 4)
+
+local vertFill = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 0),
+	Position = UDim2.new(0, 0, 1, 0),
+	BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+	BackgroundTransparency = 0.1,
+	BorderSizePixel = 0,
+	Visible = false,
+	ZIndex = 21,
+}, stealBarFrame)
+corner(vertFill, 13)
+
+task.spawn(function()
+	local frames, t0 = 0, tick()
+	while fpsLbl and fpsLbl.Parent do
+		frames += 1
+		local now = tick()
+		if now - t0 >= 0.5 then
+			fpsLbl.Text = "FPS " .. math.floor(frames / (now - t0) + 0.5)
+			frames, t0 = 0, now
+		end
+		task.wait()
+	end
+end)
+
+task.spawn(function()
+	while pingLbl and pingLbl.Parent do
+		pcall(function()
+			local ping = math.floor(game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue() + 0.5)
+			local col = ping < 80 and Color3.fromRGB(0, 255, 120)
+				or ping < 150 and Color3.fromRGB(255, 200, 0)
+				or Color3.fromRGB(255, 60, 60)
+			pingLbl.Text = "PING " .. tostring(ping) .. "ms"
+			pingLbl.TextColor3 = col
+		end)
+		task.wait(0.5)
+	end
+end)
+
+updateStealBarLayout = function()
+	local pct = math.clamp(tonumber(stealVisualPct) or 0, 0, 1)
+	pctLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+
+	if StealBarOrientation == "Vertical" then
+		barScale.Scale = StealBarScale / 100
+		stealBarFrame.Size = UDim2.fromOffset(SB_VERT_W, SB_VERT_H)
+		barCorner.CornerRadius = UDim.new(0, 13)
+
+		avatarImg.Visible = false
+		fpsLbl.Visible = false
+		pingLbl.Visible = false
+		trackFrame.Visible = false
+
+		vertFill.Visible = true
+		vertFill.Size = UDim2.new(1, 0, pct, 0)
+		vertFill.Position = UDim2.new(0, 0, 1 - pct, 0)
+
+		pctLbl.Visible = true
+		pctLbl.Size = UDim2.new(1, 0, 0, 24)
+		pctLbl.Position = UDim2.new(0, 0, 0.5, -12)
+		pctLbl.TextXAlignment = Enum.TextXAlignment.Center
+		pctLbl.TextSize = 11
+	else
+		barScale.Scale = (StealBarScale / 100) * NORMAL_BASE_SCALE
+		stealBarFrame.Size = UDim2.fromOffset(SB_NORMAL_W, SB_NORMAL_H)
+		barCorner.CornerRadius = UDim.new(0, 16)
+
+		avatarImg.Visible = true
+		fpsLbl.Visible = true
+		pingLbl.Visible = true
+		trackFrame.Visible = true
+
+		vertFill.Visible = false
+
+		pctLbl.Visible = true
+		pctLbl.Size = UDim2.fromOffset(80, 30)
+		pctLbl.Position = UDim2.fromOffset(56, 8)
+		pctLbl.TextXAlignment = Enum.TextXAlignment.Left
+		pctLbl.TextSize = 24
+
+		trackFill.Size = UDim2.new(pct, 0, 1, 0)
+	end
+end
+
+task.spawn(function()
+	while stealBarFrame and stealBarFrame.Parent do
+		if stealBarFrame.Visible then
+			local pct = AutoStealEnabled and (tonumber(stealVisualPct) or 0) or 0
+			if not AutoStealEnabled then stealVisualPct = 0 end
+			updateStealBarLayout()
+			pctLbl.Text = math.floor(pct * 100) .. "%"
+		end
+		task.wait(0.016)
+	end
+end)
+
+local sbDragging, sbDragStart, sbDragPos = false, nil, nil
+
+stealBarFrame.InputBegan:Connect(function(inp)
+	if stealBarLocked then return end
+	if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+		sbDragging = true
+		sbDragStart = inp.Position
+		sbDragPos = stealBarFrame.Position
+		inp.Changed:Connect(function()
+			if inp.UserInputState == Enum.UserInputState.End then
+				sbDragging = false
+				autoSave()
+			end
+		end)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(inp)
+	if stealBarLocked then sbDragging = false; return end
+	if sbDragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) and sbDragStart and sbDragPos then
+		local d = inp.Position - sbDragStart
+		stealBarFrame.Position = UDim2.new(sbDragPos.X.Scale, sbDragPos.X.Offset + d.X, sbDragPos.Y.Scale, sbDragPos.Y.Offset + d.Y)
+	end
+end)
+
+local function updateToggleVisual(on)
+	local tw = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	if on then
+		TweenService:Create(autoKnob, tw, { Position = UDim2.fromOffset(22, 2), BackgroundColor3 = Color3.fromRGB(100, 255, 120) }):Play()
+		TweenService:Create(autoTrack, tw, { BackgroundColor3 = Color3.fromRGB(14, 30, 16) }):Play()
+		TweenService:Create(autoTrackStroke, tw, { Color = Color3.fromRGB(90, 200, 110) }):Play()
+		statusDot.BackgroundColor3 = Color3.fromRGB(100, 255, 120)
+		TweenService:Create(titleDot, TweenInfo.new(0.2), { BackgroundColor3 = Color3.fromRGB(100, 255, 120) }):Play()
+		stealBarFrame.Visible = true
+		updateStealBarLayout()
+	else
+		TweenService:Create(autoKnob, tw, { Position = UDim2.fromOffset(2, 2), BackgroundColor3 = Color3.fromRGB(120, 120, 120) }):Play()
+		TweenService:Create(autoTrack, tw, { BackgroundColor3 = Color3.fromRGB(18, 18, 18) }):Play()
+		TweenService:Create(autoTrackStroke, tw, { Color = Color3.fromRGB(70, 70, 70) }):Play()
+		statusDot.BackgroundColor3 = Color3.fromRGB(255, 80, 100)
+		TweenService:Create(titleDot, TweenInfo.new(0.2), { BackgroundColor3 = Color3.fromRGB(255, 80, 100) }):Play()
+		stealBarFrame.Visible = false
+	end
+end
+
+autoBtn.Activated:Connect(function()
+	AutoStealEnabled = not AutoStealEnabled
+	if AutoStealEnabled then startAutoSteal() else stopAutoSteal() end
+	updateToggleVisual(AutoStealEnabled)
+	saveConfig()
+end)
+
+collapseBtn.Activated:Connect(function()
+	isCollapsed = not isCollapsed
+	local vis = not isCollapsed
+	collapseBtn.Text = isCollapsed and "+" or "–"
+	bgBtn.Visible = vis
+	lockBtn.Visible = vis
+	statusPanel.Visible = vis
+	radiusPanel.Visible = vis
+	pctPanel.Visible = vis
+	autoPanel.Visible = vis
+	sizePanel.Visible = vis
+	stylePanel.Visible = vis
+	colorPanel.Visible = vis
+	if isCollapsed then
+		bgPanel.Visible = false
+		bgPanelOpen = false
+	end
+	TweenService:Create(main, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), {
+		Size = UDim2.fromOffset(GUI_W, isCollapsed and GUI_H_COLLAPSED or GUI_H_EXPANDED),
+	}):Play()
+end)
+
+local dragging, dragStart, startPos = false, nil, nil
+
+main.InputBegan:Connect(function(input)
+	if stealBarLocked then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true; dragStart = input.Position; startPos = main.Position
+	end
+end)
+UserInputService.InputChanged:Connect(function(input)
+	if stealBarLocked then dragging = false; return end
+	if not dragging then return end
+	if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+	local d = input.Position - dragStart
+	main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+end)
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		if dragging then
+			dragging = false
+			autoSave()
+		end
+	end
+end)
+
+task.spawn(function()
+	task.wait(0.5)
+	local cfg = loadConfig()
+	if not cfg then return end
+	if cfg.stealMode then
+		StealMode = math.clamp(math.floor(tonumber(cfg.stealMode) or 1), 1, 4)
+		refreshPctButtons()
+	end
+	if cfg.stealRadius then
+		StealRadius = math.clamp(math.floor(tonumber(cfg.stealRadius) or 60), 1, 500)
+		radiusValBox.Text = tostring(StealRadius)
+	end
+	if cfg.selectedBG then
+		local idx = tonumber(cfg.selectedBG)
+		if idx and BG_IDS[idx] then
+			selectedBG = idx
+			bgImage.Image = BG_IDS[idx]
+			for j, stroke in ipairs(bgThumbs) do
+				stroke.Color = j == idx and Color3.fromRGB(180, 255, 180) or Color3.fromRGB(55, 55, 55)
+			end
+		end
+	end
+	if cfg.stealBarScale then
+		StealBarScale = math.clamp(math.floor(tonumber(cfg.stealBarScale) or 100), 50, 250)
+		sizeValBox.Text = StealBarScale .. "%"
+	end
+	if cfg.stealBarOrientation then
+		StealBarOrientation = cfg.stealBarOrientation == "Vertical" and "Vertical" or "Normal"
+		refreshStyleButtons()
+	end
+	if cfg.stealBarColor then
+		for _, c in ipairs(BAR_COLORS) do
+			if c.name == cfg.stealBarColor then StealBarColorName = c.name end
+		end
+		refreshColorSwatches()
+		applyBarColor()
+	end
+	if cfg.barPosX and cfg.barPosY then
+		stealBarFrame.Position = UDim2.new(cfg.barPosXS or 0.5, cfg.barPosX, cfg.barPosYS or 0.86, cfg.barPosY)
+	end
+	if cfg.mainPosX and cfg.mainPosY then
+		main.Position = UDim2.new(cfg.mainPosXS or 0.5, cfg.mainPosX, cfg.mainPosYS or 0.5, cfg.mainPosY)
+	end
+	if cfg.locked ~= nil then
+		stealBarLocked = cfg.locked and true or false
+		applyLockVisual()
+	end
+	if cfg.autoSteal then
+		AutoStealEnabled = true
+		startAutoSteal()
+		updateToggleVisual(true)
+	end
+	updateStealBarLayout()
+end)
+
+updateToggleVisual(false)
+updateStealBarLayout()
+
+print("VEX AUTO STEAL 🍀 LOADED")
